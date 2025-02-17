@@ -9,3 +9,6 @@ __pycache__/
 ckpts/
 venv
 venv/
+
+*/**/*.csv
+*/**/*.wav
