@@ -32,6 +32,8 @@ from transformers import (
     trainer_utils,
 )
 
+import pickle
+
 
 if is_apex_available():
     from apex import amp
@@ -207,9 +209,14 @@ class Orthography:
                 words_to_remove={"sil"},  # fixing "sil" in arabic_speech_corpus dataset
                 untransliterator=arabic.buckwalter.untransliterate,
             )
+        if name == "korean":
+            return cls(
+                do_lower_case=False,
+            )
         raise ValueError(f"Unsupported orthography: '{name}'.")
 
     def preprocess_for_training(self, text: str) -> str:
+        # TODO: 한글에 대해 전처리 점검
         # TODO(elgeish) return a pipeline (e.g., from jiwer) instead? Or rely on branch predictor as is
         if len(self.translation_table) > 0:
             text = text.translate(self.translation_table)
@@ -239,6 +246,8 @@ class Orthography:
                 cache_dir=model_args.cache_dir,
                 do_lower_case=self.do_lower_case,
                 word_delimiter_token=self.word_delimiter_token,
+                bos_token=None,
+                eos_token=None,
             )
         return Wav2Vec2Processor(feature_extractor, tokenizer)
 
@@ -405,11 +414,38 @@ def main():
     orthography = Orthography.from_name(data_args.orthography.lower())
     orthography.tokenizer = model_args.tokenizer
     processor = orthography.create_processor(model_args)
+    
+    # sample_text = "안녕하세요 한국어 테스트입니다"
+    # decomposed = orthography._decompose_korean(sample_text)
 
-    if data_args.dataset_name == 'emotion':
-        train_dataset = datasets.load_dataset('csv', data_files='iemocap/iemocap_' + data_args.split_id + '.train.csv', cache_dir=model_args.cache_dir)['train']
-        val_dataset = datasets.load_dataset('csv', data_files='iemocap/iemocap_' + data_args.split_id + '.test.csv', cache_dir=model_args.cache_dir)['train']
-        cls_label_map = {"e0":0, "e1":1, "e2":2, "e3":3}
+    dataset_pickle_path = os.path.join(model_args.cache_dir, f"{data_args.dataset_name}_{data_args.split_id}_dataset.pkl") if model_args.cache_dir else f"{data_args.dataset_name}_{data_args.split_id}_dataset.pkl"
+
+    if os.path.exists(dataset_pickle_path):
+        logger.info(f"Pickle 파일({dataset_pickle_path})이 존재합니다. 데이터셋을 pickle에서 불러옵니다.")
+        with open(dataset_pickle_path, "rb") as f:
+            train_dataset, val_dataset, cls_label_map = pickle.load(f)
+    else:
+        if data_args.dataset_name == 'emotion':
+            train_dataset = datasets.load_dataset('csv', data_files='iemocap/iemocap_' + data_args.split_id + '.train.csv', cache_dir=model_args.cache_dir)['train']
+            val_dataset = datasets.load_dataset('csv', data_files='iemocap/iemocap_' + data_args.split_id + '.test.csv', cache_dir=model_args.cache_dir)['train']
+            cls_label_map = {"e0": 0, "e1": 1, "e2": 2, "e3": 3}
+        elif data_args.dataset_name == 'kemdy19':
+            train_dataset = datasets.load_dataset('csv', data_files='kemdy19/kemdy19_' + data_args.split_id + '.train.csv', cache_dir=model_args.cache_dir)['train']
+            val_dataset = datasets.load_dataset('csv', data_files='kemdy19/kemdy19_' + data_args.split_id + '.test.csv', cache_dir=model_args.cache_dir)['train']
+            cls_label_map = {"e0": 0, "e1": 1, "e2": 2, "e3": 3}
+        
+        with open(dataset_pickle_path, "wb") as f:
+            pickle.dump((train_dataset, val_dataset, cls_label_map), f)
+        logger.info(f"데이터셋을 pickle 파일({dataset_pickle_path})에 저장하였습니다.")
+        
+    # if data_args.dataset_name == 'emotion':
+    #     train_dataset = datasets.load_dataset('csv', data_files='iemocap/iemocap_' + data_args.split_id + '.train.csv', cache_dir=model_args.cache_dir)['train']
+    #     val_dataset = datasets.load_dataset('csv', data_files='iemocap/iemocap_' + data_args.split_id + '.test.csv', cache_dir=model_args.cache_dir)['train']
+    #     cls_label_map = {"e0": 0, "e1": 1, "e2": 2, "e3": 3}
+    # elif data_args.dataset_name == 'kemdy19':
+    #     train_dataset = datasets.load_dataset('csv', data_files='kemdy19/kemdy19_' + data_args.split_id + '.train.csv', cache_dir=model_args.cache_dir)['train']
+    #     val_dataset = datasets.load_dataset('csv', data_files='kemdy19/kemdy19_' + data_args.split_id + '.test.csv', cache_dir=model_args.cache_dir)['train']
+    #     cls_label_map = {"e0": 0, "e1": 1, "e2": 2, "e3": 3}
 
     model = Wav2Vec2ForCTCnCLS.from_pretrained(
         model_args.model_name_or_path,
@@ -429,7 +465,17 @@ def main():
     )
     text_updates = []
 
-    def prepare_example(example, audio_only=False):  # TODO(elgeish) make use of multiprocessing?
+    def prepare_example(example, audio_only=False):
+        """
+        단일 오디오 데이터를 로드, 텍스트 데이터를 정규화.
+
+        Args:
+            example (dict): 전처리할 예제 데이터. 오디오 파일 경로와 텍스트 데이터 포함.
+            audio_only (bool, optional): True로 설정하면 오디오 데이터만 처리하고 텍스트 데이터는 무시. 기본값은 False.
+
+        Returns:
+            dict: 전처리된 데이터. 오디오 데이터와 샘플링 레이트, (옵션) 정규화된 텍스트 데이터 포함.
+        """
         example["speech"], example["sampling_rate"] = librosa.load(example[data_args.speech_file_column], sr=target_sr)
         if data_args.max_duration_in_seconds is not None:
             example["duration_in_seconds"] = len(example["speech"]) / example["sampling_rate"]
@@ -457,17 +503,34 @@ def main():
             train_dataset = train_dataset.filter(filter_by_max_duration, remove_columns=["duration_in_seconds"])
             if len(train_dataset) > old_train_size:
                 logger.warning(
-                    f"Filtered out {len(train_dataset) - old_train_size} train example(s) longer than {data_args.max_duration_in_seconds} second(s)."
+                    f"Filtered out {len(train_dataset) - old_train_size} train example(s) with empty text."
                 )
         if training_args.do_predict or training_args.do_eval:
             old_val_size = len(val_dataset)
             val_dataset = val_dataset.filter(filter_by_max_duration, remove_columns=["duration_in_seconds"])
             if len(val_dataset) > old_val_size:
                 logger.warning(
-                    f"Filtered out {len(val_dataset) - old_val_size} validation example(s) longer than {data_args.max_duration_in_seconds} second(s)."
+                    f"Filtered out {len(val_dataset) - old_val_size} validation example(s) with empty text."
                 )
-    # logger.info(f"Split sizes: {len(train_dataset)} train and {len(val_dataset)} validation.")
 
+    def filter_empty_text(example):
+        return len(example[data_args.target_text_column]) > 0
+    
+    if training_args.do_train:
+        old_train_size = len(train_dataset)
+        train_dataset = train_dataset.filter(filter_empty_text)
+        if len(train_dataset) > old_train_size:
+            logger.warning(
+                f"Filtered out {len(train_dataset) - old_train_size} train example(s) with empty text."
+            )
+    if training_args.do_predict or training_args.do_eval:
+        old_val_size = len(val_dataset)
+        val_dataset = val_dataset.filter(filter_empty_text)
+        if len(val_dataset) > old_val_size:
+            logger.warning(
+                f"Filtered out {len(val_dataset) - old_val_size} validation example(s) with empty text."
+            )
+    
     logger.warning(f"Updated {len(text_updates)} transcript(s) using '{data_args.orthography}' orthography rules.")
     if logger.isEnabledFor(logging.DEBUG):
         for original_text, updated_text in text_updates:
@@ -475,6 +538,16 @@ def main():
     text_updates = None
 
     def prepare_dataset(batch, audio_only=False):
+        """
+        주어진 배치를 전처리하여 입력 값과 (옵션) 레이블을 생성.
+
+        Args:
+            batch (dict): 전처리할 배치 데이터. 오디오 데이터와 샘플링 레이트, 감정 레이블 포함.
+            audio_only (bool, optional): True로 설정하면 오디오 데이터만 처리하고 텍스트 데이터는 무시. 기본값은 False.
+
+        Returns:
+            dict: 전처리된 배치 데이터. 입력 값과 (옵션) 레이블 포함.
+        """
         # check that all files have the correct sampling rate
         assert (
             len(set(batch["sampling_rate"])) == 1
