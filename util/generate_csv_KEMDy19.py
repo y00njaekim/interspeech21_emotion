@@ -2,10 +2,10 @@ import os
 import csv
 import glob
 
-KEMDY19_ROOT = "/home/jovyan/YJ_DATA/dataset/KEMDy19_v1_3"
+KEMDY19_ROOT = "/home/YJ_DATA/dataset/KEMDy19_v1_3"
 WAV_ROOT = os.path.join(KEMDY19_ROOT, "wav")
 ANNOTATION_ROOT = os.path.join(KEMDY19_ROOT, "annotation")
-OUTPUT_DIR = "/home/jovyan/YJ_DATA/interspeech21_emotion/kemdy19"
+OUTPUT_DIR = "/home/YJ_DATA/interspeech21_emotion/kemdy19"
 
 emotion_map = {
     "neutral": "e0",
@@ -95,6 +95,7 @@ def make_csv_lines_for_session(session_num, gender):
 
 def main():
     num_sessions = 20
+    num_folds = 10
     session_gender_data = {}
     
     for s in range(1, num_sessions+1):
@@ -102,32 +103,36 @@ def main():
             data_lines = make_csv_lines_for_session(s, gender)
             session_gender_data[(s, gender)] = data_lines
             
-    for test_sess in range(1, num_sessions+1):
-        for test_gender in ['F', 'M']:
-            test_data = session_gender_data[(test_sess, test_gender)]
-            train_data = []
+    for fold in range(num_folds):
+        test_sessions = [fold*2 + 1, fold*2 + 2]
+        test_data = []
+        train_data = []
+        
+        for test_sess in test_sessions:
+            for test_gender in ['F', 'M']:
+                test_data.extend(session_gender_data[(test_sess, test_gender)])
+        
+        for s in range(1, num_sessions+1):
+            for g in ['F', 'M']:
+                if s not in test_sessions:
+                    train_data.extend(session_gender_data[(s, g)])
+        
+        out_test_csv = os.path.join(OUTPUT_DIR, f"kemdy19_fold{fold+1:02d}.test.csv")
+        out_train_csv = os.path.join(OUTPUT_DIR, f"kemdy19_fold{fold+1:02d}.train.csv")
+        
+        with open(out_test_csv, 'w', encoding='utf-8', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(["file", "emotion", "text"])
+            for (wav_path, emo, txt) in test_data:
+                writer.writerow([wav_path, emo, txt])
             
-            for s in range(1, num_sessions+1):
-                for g in ['F', 'M']:
-                    if s != test_sess or g != test_gender:
-                        train_data.extend(session_gender_data[(s, g)])
+        with open(out_train_csv, 'w', encoding='utf-8', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(["file", "emotion", "text"])
+            for (wav_path, emo, txt) in train_data:
+                writer.writerow([wav_path, emo, txt])
             
-            out_test_csv = os.path.join(OUTPUT_DIR, f"kemdy19_{test_sess:02d}{test_gender}.test.csv")
-            out_train_csv = os.path.join(OUTPUT_DIR, f"kemdy19_{test_sess:02d}{test_gender}.train.csv")
-            
-            with open(out_test_csv, 'w', encoding='utf-8', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(["file", "emotion", "text"])
-                for (wav_path, emo, txt) in test_data:
-                    writer.writerow([wav_path, emo, txt])
-                
-            with open(out_train_csv, 'w', encoding='utf-8', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(["file", "emotion", "text"])
-                for (wav_path, emo, txt) in train_data:
-                    writer.writerow([wav_path, emo, txt])
-                
-            print(f"[Session {test_sess:02d} {test_gender}] train: {len(train_data)} / test: {len(test_data)}")
+        print(f"[Fold {fold+1:02d}] train: {len(train_data)} / test: {len(test_data)}")
 
 if __name__ == "__main__":
     main()
