@@ -8,6 +8,8 @@ export WORKER_NUM=4
 /home/jovyan/YJ_DATA/miniconda3/envs/py37/bin/python run_emotion.py \
 --output_dir=output/tmp \
 --cache_dir=cache_kor/ \
+--overwrite_cache \
+--overwrite_output_dir \
 --num_train_epochs=200 \
 --per_device_train_batch_size="2" \
 --per_device_eval_batch_size="2" \

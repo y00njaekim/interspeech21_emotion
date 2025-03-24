@@ -454,6 +454,7 @@ def main():
         vocab_size=len(processor.tokenizer),
         cls_len=len(cls_label_map),
         alpha=model_args.alpha,
+        ctc_zero_infinity=True
     )
  
     wer_metric = datasets.load_metric("wer")
@@ -599,7 +600,7 @@ def main():
         # we do not want to group tokens when computing the metrics
         ctc_label_str = processor.batch_decode(pred.label_ids[0], group_tokens=False)
         if logger.isEnabledFor(logging.DEBUG):
-            for reference, predicted in zip(label_str, pred_str):
+            for reference, predicted in zip(ctc_label_str, ctc_pred_str):
                 logger.debug(f'reference: "{reference}"')
                 logger.debug(f'predicted: "{predicted}"')
                 if orthography.untransliterator is not None:
@@ -611,7 +612,9 @@ def main():
 
     if model_args.freeze_feature_extractor:
         model.freeze_feature_extractor()
-
+        
+    torch.autograd.set_detect_anomaly(True)
+    
     trainer = CTCTrainer(
         model=model,
         data_collator=data_collator,
