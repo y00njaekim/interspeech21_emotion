@@ -5,6 +5,9 @@ export LR=5e-5
 export ACC=4 # batch size * acc = 8
 export WORKER_NUM=4
 
+# 현재 시간을 포함한 run 이름 생성
+export RUN_NAME="emotion_only_$(date +%Y%m%d_%H%M%S)_01F"
+
 /home/jovyan/YJ_DATA/miniconda3/envs/py37/bin/python run_emotion.py \
 --output_dir=output/tmp \
 --cache_dir=cache/ \
@@ -27,7 +30,10 @@ export WORKER_NUM=4
 --model_name_or_path=facebook/$MODEL \
 --tokenizer facebook/$TOKENIZER \
 --preprocessing_num_workers=$WORKER_NUM \
---dataloader_num_workers $WORKER_NUM
+--dataloader_num_workers $WORKER_NUM \
+--report_to="wandb" \
+--wandb_project="emotion_recognition" \
+--wandb_run_name="$RUN_NAME"
 # --freeze_feature_extractor \
 # --gradient_checkpointing true \
 # --fp16 \

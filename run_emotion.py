@@ -74,6 +74,14 @@ class ModelArguments:
         default=None,
         metadata={"help": "Path to pretrained tokenizer"}
     )
+    wandb_project: Optional[str] = field(
+        default=None,
+        metadata={"help": "Project name for wandb logging"},
+    )
+    wandb_run_name: Optional[str] = field(
+        default=None,
+        metadata={"help": "Run name for wandb logging"},
+    )
 
 
 def configure_logger(model_args: ModelArguments, training_args: TrainingArguments):
@@ -395,6 +403,12 @@ def main():
 
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     configure_logger(model_args, training_args)
+
+    # wandb 설정 적용
+    if model_args.wandb_project is not None:
+        training_args.wandb_project = model_args.wandb_project
+    if model_args.wandb_run_name is not None:
+        training_args.run_name = model_args.wandb_run_name
 
     # Detecting last checkpoint.
     last_checkpoint = None
