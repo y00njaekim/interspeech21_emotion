@@ -1,6 +1,6 @@
 export MODEL=wav2vec2-base
 export TOKENIZER=wav2vec2-base
-export ALPHA=0.1
+export ALPHA=0.0
 export LR=5e-5
 export ACC=4 # batch size * acc = 8
 export WORKER_NUM=4
