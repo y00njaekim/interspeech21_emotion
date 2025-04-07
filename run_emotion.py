@@ -444,8 +444,8 @@ def main():
             val_dataset = datasets.load_dataset('csv', data_files='iemocap/iemocap_' + data_args.split_id + '.test.csv', cache_dir=model_args.cache_dir)['train']
             cls_label_map = {"e0": 0, "e1": 1, "e2": 2, "e3": 3}
         elif data_args.dataset_name == 'kemdy19':
-            train_dataset = datasets.load_dataset('csv', data_files='kemdy19/kemdy19_' + data_args.split_id + '.train.csv', cache_dir=model_args.cache_dir)['train']
-            val_dataset = datasets.load_dataset('csv', data_files='kemdy19/kemdy19_' + data_args.split_id + '.test.csv', cache_dir=model_args.cache_dir)['train']
+            train_dataset = datasets.load_dataset('csv', data_files='kemdy19_balanced/kemdy19_' + data_args.split_id + '.train.csv', cache_dir=model_args.cache_dir)['train']
+            val_dataset = datasets.load_dataset('csv', data_files='kemdy19_balanced/kemdy19_' + data_args.split_id + '.test.csv', cache_dir=model_args.cache_dir)['train']
             cls_label_map = {"e0": 0, "e1": 1, "e2": 2, "e3": 3}
         
         with open(dataset_pickle_path, "wb") as f:

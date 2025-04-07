@@ -1,6 +1,13 @@
 import os
 import csv
 import glob
+import numpy as np
+import random
+
+# 재현성을 위한 random seed 설정
+RANDOM_SEED = 42
+random.seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
 
 KEMDY19_ROOT = "/home/YJ_DATA/dataset/KEMDy19_v1_3"
 WAV_ROOT = os.path.join(KEMDY19_ROOT, "wav")
@@ -98,27 +105,43 @@ def main():
     num_folds = 10
     session_gender_data = {}
     
+    # 세션 순서를 랜덤하게 섞기
+    all_sessions = list(range(1, num_sessions+1))
+    random.shuffle(all_sessions)
+    
+    # 세션 데이터 수집
     for s in range(1, num_sessions+1):
         for gender in ['F', 'M']:
             data_lines = make_csv_lines_for_session(s, gender)
             session_gender_data[(s, gender)] = data_lines
-            
+    
+    # fold 생성 및 데이터 저장
     for fold in range(num_folds):
-        test_sessions = [fold*2 + 1, fold*2 + 2]
+        # 각 fold마다 2개의 세션을 테스트 세트로 사용
+        test_sessions = all_sessions[fold*2:(fold+1)*2]
         test_data = []
         train_data = []
         
+        # 테스트 세션의 데이터 수집
         for test_sess in test_sessions:
             for test_gender in ['F', 'M']:
                 test_data.extend(session_gender_data[(test_sess, test_gender)])
         
-        for s in range(1, num_sessions+1):
-            for g in ['F', 'M']:
-                if s not in test_sessions:
+        # 나머지 세션의 데이터를 학습 세트로 사용
+        for s in all_sessions:
+            if s not in test_sessions:
+                for g in ['F', 'M']:
                     train_data.extend(session_gender_data[(s, g)])
         
+        # 데이터 저장
         out_test_csv = os.path.join(OUTPUT_DIR, f"kemdy19_fold{fold+1:02d}.test.csv")
         out_train_csv = os.path.join(OUTPUT_DIR, f"kemdy19_fold{fold+1:02d}.train.csv")
+        
+        # fold 구성 정보 저장
+        fold_info_file = os.path.join(OUTPUT_DIR, f"kemdy19_fold{fold+1:02d}.info.txt")
+        with open(fold_info_file, 'w', encoding='utf-8') as f:
+            f.write(f"Test sessions: {test_sessions}\n")
+            f.write(f"Random seed: {RANDOM_SEED}\n")
         
         with open(out_test_csv, 'w', encoding='utf-8', newline='') as f:
             writer = csv.writer(f)
@@ -133,6 +156,7 @@ def main():
                 writer.writerow([wav_path, emo, txt])
             
         print(f"[Fold {fold+1:02d}] train: {len(train_data)} / test: {len(test_data)}")
+        print(f"Test sessions: {test_sessions}")
 
 if __name__ == "__main__":
     main()
