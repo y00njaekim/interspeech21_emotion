@@ -33,7 +33,11 @@ from transformers import (
 )
 
 import pickle
+from torch.utils.data import DataLoader
 
+# Captum Import
+from captum.attr import LayerIntegratedGradients, visualization as viz
+from tqdm import tqdm # for progress bar
 
 if is_apex_available():
     from apex import amp
@@ -166,6 +170,14 @@ class DataTrainingArguments:
         metadata={"help": "Output file."},
     )
 
+    # Interpretation 관련 필드 추가
+    do_interpret: bool = field(
+        default=False, metadata={"help": "Whether to compute interpretation maps (IG and Attention)."}
+    )
+    interpretation_output_dir: Optional[str] = field(
+        default=None, metadata={"help": "Output directory for interpretation results."}
+    )
+
 
 @dataclass
 class Orthography:
@@ -295,6 +307,22 @@ class DataCollatorCTCWithPadding:
     audio_only = False
 
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
+        """배치 데이터를 동적으로 패딩하여 모델 입력에 적합한 형태로 변환합니다.
+
+        Args:
+            features (List[Dict[str, Union[List[int], torch.Tensor]]]): 배치 크기만큼의 샘플이 담긴 리스트.
+                각 샘플은 딕셔너리 형태로 다음 키들을 포함합니다:
+                - input_values: 오디오 파형을 프로세서로 변환한 특징 벡터
+                - labels: [CTC 토큰 시퀀스, 감정 레이블]이 담긴 리스트 (audio_only가 False일 때만 존재)
+                - file: 오디오 파일 경로 (선택적)
+
+        Returns:
+            Dict[str, torch.Tensor]: 패딩된 배치 데이터. 다음 키들을 포함합니다:
+                - input_values: 패딩된 입력 특징 벡터들 (batch_size, sequence_length)
+                - labels: (CTC 레이블, 감정 레이블) 튜플 (audio_only가 False일 때만 존재)
+                - attention_mask: 패딩된 위치를 마스킹하기 위한 이진 텐서
+                - file: 입력 파일 경로들 (있는 경우에만)
+        """
         # split inputs and labels since they have to be of different lenghts and need
         # different padding methods
         input_features = [{"input_values": feature["input_values"]} for feature in features]
@@ -322,6 +350,13 @@ class DataCollatorCTCWithPadding:
             # replace padding with -100 to ignore loss correctly
             ctc_labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
             batch["labels"] = (ctc_labels, torch.tensor(cls_labels)) # labels = (ctc_labels, cls_labels)
+
+        # 파일 경로 정보 추가 (있는 경우에만)
+        if "file" in features[0]:
+            if isinstance(features[0]["file"], list):
+                batch["file"] = [feature["file"][0] for feature in features]
+            else:
+                batch["file"] = [feature["file"] for feature in features]
 
         return batch
 
@@ -670,11 +705,159 @@ def main():
 
     elif training_args.do_eval:
         predictions, labels, metrics = trainer.predict(val_dataset, metric_key_prefix="eval")
-        logits_ctc, logits_cls = predictions
+        logits_ctc, logits_cls, attention_weights = predictions
         pred_ids = np.argmax(logits_cls, axis=-1)
         correct = np.sum(pred_ids == labels[1])
         acc = correct / len(pred_ids)
         print('correct:', correct, ', acc:', acc)
+
+    # Interpretation (IG + Attention) 계산 로직 추가
+    if data_args.do_interpret:
+        if data_args.interpretation_output_dir is None:
+            data_args.interpretation_output_dir = os.path.join(training_args.output_dir, "interpretation_results")
+        
+        logger.info("********* Interpretation 계산 시작 (IG + Attention) *********")
+        os.makedirs(data_args.interpretation_output_dir, exist_ok=True)
+
+        # 모델 로드 (이미 로드되어 있다면 재사용, 아니라면 로드)
+        # main 함수 초반에서 모델 로드 로직을 활용하거나 여기서 다시 로드
+        model_path = training_args.output_dir
+        if os.path.isdir(model_path):
+            checkpoint = get_last_checkpoint(model_path)
+            if checkpoint:
+                model_path = checkpoint
+                logger.info(f"체크포인트를 사용합니다: {checkpoint}")
+        elif model_args.model_name_or_path and os.path.isdir(model_args.model_name_or_path):
+            model_path = model_args.model_name_or_path
+        else:
+             logger.warning(f"모델 경로가 유효하지 않아 pretrained 모델을 사용합니다: {model_args.model_name_or_path}")
+             model_path = model_args.model_name_or_path
+             # Note: If loading a model trained elsewhere, ensure cls_len matches
+
+        logger.info(f"해석을 위해 모델 로드 중: {model_path}")
+        model = Wav2Vec2ForCTCnCLS.from_pretrained(
+            model_path,
+            cache_dir=model_args.cache_dir,
+            cls_len=len(cls_label_map), # Ensure cls_label_map is defined earlier
+            alpha=model_args.alpha,
+            ctc_zero_infinity=True
+        ).to(training_args.device)
+        model.eval()
+        logger.info("모델 로드 완료")
+
+        # 데이터셋 로드 (이미 전처리된 val_dataset 사용)
+        # val_dataset 에는 'input_values', 'file' 등이 있어야 함
+        # 해석을 위해서는 audio_only=False로 전처리된 데이터셋이 필요할 수 있음
+        # 만약 val_dataset이 audio_only=True로 생성되었다면, 다시 로드 및 전처리 필요
+        # 여기서는 val_dataset이 적절히 준비되었다고 가정
+        logger.info("해석을 위한 데이터셋 준비 중...")
+        
+        # 해석을 위해 데이터셋 다시 로드
+        if data_args.dataset_name == 'emotion':
+            val_dataset = datasets.load_dataset('csv', data_files='iemocap/iemocap_' + data_args.split_id + '.test.csv', cache_dir=model_args.cache_dir)['train']
+        elif data_args.dataset_name == 'kemdy19':
+            val_dataset = datasets.load_dataset('csv', data_files='kemdy19_balanced/kemdy19_' + data_args.split_id + '.test.csv', cache_dir=model_args.cache_dir)['train']
+        
+        # 데이터셋 전처리
+        val_dataset = val_dataset.map(
+            prepare_example,
+            fn_kwargs={'audio_only':True}
+        )
+        
+        if data_args.max_duration_in_seconds is not None:
+            val_dataset = val_dataset.filter(
+                filter_by_max_duration,
+                remove_columns=["duration_in_seconds"]
+            )
+        
+        val_dataset = val_dataset.map(
+            prepare_dataset,
+            fn_kwargs={'audio_only':True},
+            batch_size=training_args.per_device_eval_batch_size,
+            batched=True,
+            num_proc=data_args.preprocessing_num_workers
+        )
+        
+        # 데이터 로더 생성
+        interpret_collator = DataCollatorCTCWithPadding(processor=processor, padding=True)
+        interpret_dataloader = DataLoader(val_dataset, batch_size=1, collate_fn=interpret_collator)
+
+        # Layer Integrated Gradients 설정
+        def wrapper_forward(inputs, attention_mask=None):
+            outputs = model(
+                input_values=inputs,
+                attention_mask=attention_mask,
+                output_attentions=False,
+                output_hidden_states=True,
+                return_dict=True,
+                labels=None,
+                if_ctc=True,
+                if_cls=True
+            )
+            # 감정 분류 로짓만 반환
+            return outputs.logits[1]
+
+        lig = LayerIntegratedGradients(wrapper_forward, model.wav2vec2.feature_extractor)
+
+        total_files = len(interpret_dataloader)
+        logger.info(f"총 {total_files}개의 파일에 대해 해석을 수행합니다.")
+
+        for i, batch in enumerate(tqdm(interpret_dataloader, desc="Interpreting samples")):
+            input_values = batch['input_values'].to(training_args.device)
+            attention_mask = torch.ones(input_values.shape, device=training_args.device)
+
+            file_path = batch['file'][0]  # 배치의 첫 번째 파일 경로 사용
+            base_filename = os.path.basename(file_path)
+            name, _ = os.path.splitext(base_filename)
+            
+            logger.debug(f"파일 처리 중 ({i+1}/{total_files}): {base_filename}")
+
+            try:
+                # 1. 모델 예측 및 Attention 가중치 얻기
+                with torch.no_grad():
+                    outputs = model(
+                        input_values=input_values,
+                        attention_mask=attention_mask,
+                        output_attentions=True,
+                        output_hidden_states=True,
+                        return_dict=True,
+                        labels=None,
+                        if_ctc=True,
+                        if_cls=True
+                    )
+                logits_cls = outputs.logits[1]  # Classification logits
+                attention_weights = outputs.logits[2]  # Attention weights
+                predicted_class = torch.argmax(logits_cls, dim=-1).item()
+
+                # Attention 가중치 저장
+                att_output_filename = os.path.join(data_args.interpretation_output_dir, f"{name}_attention_weights.npy")
+                np.save(att_output_filename, attention_weights.squeeze().cpu().numpy())
+                logger.debug(f"Attention weights 저장 완료: {att_output_filename}")
+
+                # 2. Layer Integrated Gradients 계산
+                baseline = torch.zeros_like(input_values)
+                attributions_ig = lig.attribute(
+                    inputs=input_values,
+                    baselines=baseline,
+                    target=predicted_class,
+                    additional_forward_args=(attention_mask,),
+                    internal_batch_size=1
+                )
+                
+                # IG 결과는 feature_extractor 출력의 shape를 가짐
+                ig_map = attributions_ig.abs().sum(dim=1).squeeze()
+                ig_map = ig_map.cpu().numpy()
+
+                # IG 결과 저장
+                ig_output_filename = os.path.join(data_args.interpretation_output_dir, f"{name}_ig_feature_extractor.npy")
+                np.save(ig_output_filename, ig_map)
+                logger.debug(f"IG 결과 저장 완료: {ig_output_filename}")
+
+            except Exception as e:
+                logger.error(f"{base_filename} 해석 중 오류 발생: {e}", exc_info=True)
+                continue
+        
+        logger.info("********* Interpretation 계산 완료 *********")
 
 if __name__ == "__main__":
     main()
