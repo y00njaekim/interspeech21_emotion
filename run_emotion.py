@@ -74,6 +74,10 @@ class ModelArguments:
         default=0.1,
         metadata={"help": "loss_cls + alpha * loss_ctc"},
     )
+    beta: Optional[float] = field(
+        default=0.1,
+        metadata={"help": "loss_cls + alpha * loss_ctc + beta * loss_prosody"},
+    )
     tokenizer: Optional[str] = field(
         default=None,
         metadata={"help": "Path to pretrained tokenizer"}
@@ -307,29 +311,8 @@ class DataCollatorCTCWithPadding:
     audio_only = False
 
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-        """배치 데이터를 동적으로 패딩하여 모델 입력에 적합한 형태로 변환합니다.
-
-        Args:
-            features (List[Dict[str, Union[List[int], torch.Tensor]]]): 배치 크기만큼의 샘플이 담긴 리스트.
-                각 샘플은 딕셔너리 형태로 다음 키들을 포함합니다:
-                - input_values: 오디오 파형을 프로세서로 변환한 특징 벡터
-                - labels: [CTC 토큰 시퀀스, 감정 레이블]이 담긴 리스트 (audio_only가 False일 때만 존재)
-                - file: 오디오 파일 경로 (선택적)
-
-        Returns:
-            Dict[str, torch.Tensor]: 패딩된 배치 데이터. 다음 키들을 포함합니다:
-                - input_values: 패딩된 입력 특징 벡터들 (batch_size, sequence_length)
-                - labels: (CTC 레이블, 감정 레이블) 튜플 (audio_only가 False일 때만 존재)
-                - attention_mask: 패딩된 위치를 마스킹하기 위한 이진 텐서
-                - file: 입력 파일 경로들 (있는 경우에만)
-        """
-        # split inputs and labels since they have to be of different lenghts and need
-        # different padding methods
         input_features = [{"input_values": feature["input_values"]} for feature in features]
-        if self.audio_only is False:
-            label_features = [{"input_ids": feature["labels"][:-1]} for feature in features]
-            cls_labels = [feature["labels"][-1] for feature in features]
-
+        
         batch = self.processor.pad(
             input_features,
             padding=self.padding,
@@ -337,7 +320,12 @@ class DataCollatorCTCWithPadding:
             pad_to_multiple_of=self.pad_to_multiple_of,
             return_tensors="pt",
         )
+
         if self.audio_only is False:
+            # CTC 레이블과 감정 레이블 분리
+            label_features = [{"input_ids": feature["labels"][:-1]} for feature in features]
+            cls_labels = [feature["labels"][-1] for feature in features]
+
             with self.processor.as_target_processor():
                 labels_batch = self.processor.pad(
                     label_features,
@@ -349,7 +337,20 @@ class DataCollatorCTCWithPadding:
 
             # replace padding with -100 to ignore loss correctly
             ctc_labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
-            batch["labels"] = (ctc_labels, torch.tensor(cls_labels)) # labels = (ctc_labels, cls_labels)
+            
+            # prosody 레이블 처리 - 없는 경우 기본값 사용
+            prosody_features = []
+            for feature in features:
+                if "prosody" in feature:
+                    prosody_features.append(torch.tensor(feature["prosody"], dtype=torch.float32))
+                else:
+                    prosody_features.append(torch.zeros(4))  # 4-dimensional prosody vector
+            
+            batch["labels"] = (
+                ctc_labels,
+                torch.tensor(cls_labels),
+                torch.stack(prosody_features)
+            )
 
         # 파일 경로 정보 추가 (있는 경우에만)
         if "file" in features[0]:
@@ -429,6 +430,106 @@ class CTCTrainer(Trainer):
         return loss.detach()
 
 
+def extract_prosody_tail(example, tail_ratio=0.3):
+    """음성의 뒷부분에서 prosody 특성을 추출합니다.
+    
+    Args:
+        example: 오디오 데이터가 포함된 예제
+        tail_ratio: 뒷부분 비율 (기본값: 0.3 = 30%)
+        
+    Returns:
+        prosody 특성이 추가된 예제
+    """
+    y, sr = example["speech"], example["sampling_rate"]
+    tail_start = int(len(y)*(1-tail_ratio))
+    tail = y[tail_start:]
+
+    # pitch (f0) - use librosa.pyin
+    f0, _, _ = librosa.pyin(tail, fmin=50, fmax=600)
+    f0 = np.nanmedian(f0)  # Hz
+    f0 = 0.0 if np.isnan(f0) else np.log(f0)  # log-Hz
+
+    # energy
+    rms = librosa.feature.rms(y=tail).mean()
+    energy = np.log(rms + 1e-8)
+
+    # duration
+    dur = len(tail)/sr  # seconds
+
+    # speaking rate - 임시로 0으로 설정
+    spk_rate = 0.0
+
+    example["prosody"] = np.array([f0, energy, dur, spk_rate], dtype=np.float32)
+    return example
+
+def prepare_example(example, data_args, target_sr, orthography, vocabulary_text_cleaner, text_updates, audio_only=False):
+    """
+    단일 오디오 데이터를 로드, 텍스트 데이터를 정규화.
+
+    Args:
+        example (dict): 전처리할 예제 데이터
+        data_args: 데이터 관련 인자들
+        target_sr: 목표 샘플링 레이트
+        orthography: 텍스트 정규화를 위한 orthography 객체
+        vocabulary_text_cleaner: 텍스트 정제를 위한 정규식 객체
+        text_updates: 텍스트 업데이트 기록을 위한 리스트
+        audio_only (bool, optional): True로 설정하면 오디오 데이터만 처리
+
+    Returns:
+        dict: 전처리된 데이터
+    """
+    example["speech"], example["sampling_rate"] = librosa.load(example[data_args.speech_file_column], sr=target_sr)
+    if data_args.max_duration_in_seconds is not None:
+        example["duration_in_seconds"] = len(example["speech"]) / example["sampling_rate"]
+    
+    # prosody 특성 추출 추가
+    example = extract_prosody_tail(example)
+    
+    if audio_only is False:
+        # Normalize and clean up text; order matters!
+        updated_text = orthography.preprocess_for_training(example[data_args.target_text_column])
+        updated_text = vocabulary_text_cleaner.sub("", updated_text)
+        if updated_text != example[data_args.target_text_column]:
+            text_updates.append((example[data_args.target_text_column], updated_text))
+            example[data_args.target_text_column] = updated_text
+    return example
+
+def prepare_dataset(batch, data_args, processor, cls_label_map, audio_only=False):
+    """
+    주어진 배치를 전처리하여 입력 값과 (옵션) 레이블을 생성.
+
+    Args:
+        batch (dict): 전처리할 배치 데이터
+        data_args: 데이터 관련 인자들
+        processor: 오디오 처리를 위한 프로세서
+        cls_label_map: 클래스 레이블 매핑
+        audio_only (bool, optional): True로 설정하면 오디오 데이터만 처리
+
+    Returns:
+        dict: 전처리된 배치 데이터
+    """
+    # check that all files have the correct sampling rate
+    assert (
+        len(set(batch["sampling_rate"])) == 1
+    ), f"Make sure all inputs have the same sampling rate of {processor.feature_extractor.sampling_rate}."
+    
+    batch["input_values"] = processor(batch["speech"], sampling_rate=batch["sampling_rate"][0]).input_values
+    
+    if audio_only is False:
+        cls_labels = list(map(lambda e: cls_label_map[e], batch["emotion"]))
+        with processor.as_target_processor():
+            batch["labels"] = processor(batch[data_args.target_text_column]).input_ids
+            
+        # prosody 레이블과 감정 레이블을 함께 처리
+        for i in range(len(cls_labels)):
+            batch["labels"][i] = batch["labels"][i] + [cls_labels[i]]
+            
+        # prosody 레이블이 없는 경우 기본값으로 설정
+        if "prosody" not in batch:
+            batch["prosody"] = [np.zeros(4, dtype=np.float32) for _ in range(len(batch["speech"]))]
+    
+    return batch
+
 def main():
     # See all possible arguments in src/transformers/training_args.py
     # or by passing the --help flag to this script.
@@ -467,25 +568,34 @@ def main():
     # sample_text = "안녕하세요 한국어 테스트입니다"
     # decomposed = orthography._decompose_korean(sample_text)
 
-    dataset_pickle_path = os.path.join(model_args.cache_dir, f"{data_args.dataset_name}_{data_args.split_id}_dataset.pkl") if model_args.cache_dir else f"{data_args.dataset_name}_{data_args.split_id}_dataset.pkl"
+    # dataset_pickle_path = os.path.join(model_args.cache_dir, f"{data_args.dataset_name}_{data_args.split_id}_dataset.pkl") if model_args.cache_dir else f"{data_args.dataset_name}_{data_args.split_id}_dataset.pkl"
 
-    if os.path.exists(dataset_pickle_path):
-        logger.info(f"Pickle 파일({dataset_pickle_path})이 존재합니다. 데이터셋을 pickle에서 불러옵니다.")
-        with open(dataset_pickle_path, "rb") as f:
-            train_dataset, val_dataset, cls_label_map = pickle.load(f)
-    else:
-        if data_args.dataset_name == 'emotion':
-            train_dataset = datasets.load_dataset('csv', data_files='iemocap/iemocap_' + data_args.split_id + '.train.csv', cache_dir=model_args.cache_dir)['train']
-            val_dataset = datasets.load_dataset('csv', data_files='iemocap/iemocap_' + data_args.split_id + '.test.csv', cache_dir=model_args.cache_dir)['train']
-            cls_label_map = {"e0": 0, "e1": 1, "e2": 2, "e3": 3}
-        elif data_args.dataset_name == 'kemdy19':
-            train_dataset = datasets.load_dataset('csv', data_files='kemdy19_balanced/kemdy19_' + data_args.split_id + '.train.csv', cache_dir=model_args.cache_dir)['train']
-            val_dataset = datasets.load_dataset('csv', data_files='kemdy19_balanced/kemdy19_' + data_args.split_id + '.test.csv', cache_dir=model_args.cache_dir)['train']
-            cls_label_map = {"e0": 0, "e1": 1, "e2": 2, "e3": 3}
+    # if os.path.exists(dataset_pickle_path):
+    #     logger.info(f"Pickle 파일({dataset_pickle_path})이 존재합니다. 데이터셋을 pickle에서 불러옵니다.")
+    #     with open(dataset_pickle_path, "rb") as f:
+    #         train_dataset, val_dataset, cls_label_map = pickle.load(f)
+    # else:
+    #     if data_args.dataset_name == 'emotion':
+    #         train_dataset = datasets.load_dataset('csv', data_files='iemocap/iemocap_' + data_args.split_id + '.train.csv', cache_dir=model_args.cache_dir)['train']
+    #         val_dataset = datasets.load_dataset('csv', data_files='iemocap/iemocap_' + data_args.split_id + '.test.csv', cache_dir=model_args.cache_dir)['train']
+    #         cls_label_map = {"e0": 0, "e1": 1, "e2": 2, "e3": 3}
+    #     elif data_args.dataset_name == 'kemdy19':
+    #         train_dataset = datasets.load_dataset('csv', data_files='kemdy19_balanced/kemdy19_' + data_args.split_id + '.train.csv', cache_dir=model_args.cache_dir)['train']
+    #         val_dataset = datasets.load_dataset('csv', data_files='kemdy19_balanced/kemdy19_' + data_args.split_id + '.test.csv', cache_dir=model_args.cache_dir)['train']
+    #         cls_label_map = {"e0": 0, "e1": 1, "e2": 2, "e3": 3}
         
-        with open(dataset_pickle_path, "wb") as f:
-            pickle.dump((train_dataset, val_dataset, cls_label_map), f)
-        logger.info(f"데이터셋을 pickle 파일({dataset_pickle_path})에 저장하였습니다.")
+    #     with open(dataset_pickle_path, "wb") as f:
+    #         pickle.dump((train_dataset, val_dataset, cls_label_map), f)
+    #     logger.info(f"데이터셋을 pickle 파일({dataset_pickle_path})에 저장하였습니다.")
+        
+    if data_args.dataset_name == 'emotion':
+        train_dataset = datasets.load_dataset('csv', data_files='iemocap/iemocap_' + data_args.split_id + '.train.csv', cache_dir=model_args.cache_dir)['train']
+        val_dataset = datasets.load_dataset('csv', data_files='iemocap/iemocap_' + data_args.split_id + '.test.csv', cache_dir=model_args.cache_dir)['train']
+        cls_label_map = {"e0": 0, "e1": 1, "e2": 2, "e3": 3}
+    elif data_args.dataset_name == 'kemdy19':
+        train_dataset = datasets.load_dataset('csv', data_files='kemdy19_balanced/kemdy19_' + data_args.split_id + '.train.csv', cache_dir=model_args.cache_dir)['train']
+        val_dataset = datasets.load_dataset('csv', data_files='kemdy19_balanced/kemdy19_' + data_args.split_id + '.test.csv', cache_dir=model_args.cache_dir)['train']
+        cls_label_map = {"e0": 0, "e1": 1, "e2": 2, "e3": 3}
         
     # if data_args.dataset_name == 'emotion':
     #     train_dataset = datasets.load_dataset('csv', data_files='iemocap/iemocap_' + data_args.split_id + '.train.csv', cache_dir=model_args.cache_dir)['train']
@@ -499,10 +609,11 @@ def main():
     model = Wav2Vec2ForCTCnCLS.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=model_args.cache_dir,
-        gradient_checkpointing=True, # training_args.gradient_checkpointing,
+        gradient_checkpointing=True,
         vocab_size=len(processor.tokenizer),
         cls_len=len(cls_label_map),
         alpha=model_args.alpha,
+        beta=model_args.beta,
         ctc_zero_infinity=True
     )
  
@@ -515,35 +626,21 @@ def main():
     )
     text_updates = []
 
-    def prepare_example(example, audio_only=False):
-        """
-        단일 오디오 데이터를 로드, 텍스트 데이터를 정규화.
-
-        Args:
-            example (dict): 전처리할 예제 데이터. 오디오 파일 경로와 텍스트 데이터 포함.
-            audio_only (bool, optional): True로 설정하면 오디오 데이터만 처리하고 텍스트 데이터는 무시. 기본값은 False.
-
-        Returns:
-            dict: 전처리된 데이터. 오디오 데이터와 샘플링 레이트, (옵션) 정규화된 텍스트 데이터 포함.
-        """
-        example["speech"], example["sampling_rate"] = librosa.load(example[data_args.speech_file_column], sr=target_sr)
-        if data_args.max_duration_in_seconds is not None:
-            example["duration_in_seconds"] = len(example["speech"]) / example["sampling_rate"]
-        if audio_only is False:
-            # Normalize and clean up text; order matters!
-            updated_text = orthography.preprocess_for_training(example[data_args.target_text_column])
-            updated_text = vocabulary_text_cleaner.sub("", updated_text)
-            if updated_text != example[data_args.target_text_column]:
-                text_updates.append((example[data_args.target_text_column], updated_text))
-                example[data_args.target_text_column] = updated_text
-        return example
-
     if training_args.do_train:
-        train_dataset = train_dataset.map(prepare_example, remove_columns=[data_args.speech_file_column])
+        train_dataset = train_dataset.map(
+            lambda x: prepare_example(x, data_args, target_sr, orthography, vocabulary_text_cleaner, text_updates),
+            remove_columns=[data_args.speech_file_column]
+        )
     if training_args.do_predict:
-        val_dataset = val_dataset.map(prepare_example, fn_kwargs={'audio_only':True})
+        val_dataset = val_dataset.map(
+            lambda x: prepare_example(x, data_args, target_sr, orthography, vocabulary_text_cleaner, text_updates, audio_only=True),
+            fn_kwargs={'audio_only':True}
+        )
     elif training_args.do_eval:
-        val_dataset = val_dataset.map(prepare_example, remove_columns=[data_args.speech_file_column])
+        val_dataset = val_dataset.map(
+            lambda x: prepare_example(x, data_args, target_sr, orthography, vocabulary_text_cleaner, text_updates),
+            remove_columns=[data_args.speech_file_column]
+        )
 
     if data_args.max_duration_in_seconds is not None:
         def filter_by_max_duration(example):
@@ -587,48 +684,23 @@ def main():
             logger.debug(f'Updated text: "{original_text}" -> "{updated_text}"')
     text_updates = None
 
-    def prepare_dataset(batch, audio_only=False):
-        """
-        주어진 배치를 전처리하여 입력 값과 (옵션) 레이블을 생성.
-
-        Args:
-            batch (dict): 전처리할 배치 데이터. 오디오 데이터와 샘플링 레이트, 감정 레이블 포함.
-            audio_only (bool, optional): True로 설정하면 오디오 데이터만 처리하고 텍스트 데이터는 무시. 기본값은 False.
-
-        Returns:
-            dict: 전처리된 배치 데이터. 입력 값과 (옵션) 레이블 포함.
-        """
-        # check that all files have the correct sampling rate
-        assert (
-            len(set(batch["sampling_rate"])) == 1
-        ), f"Make sure all inputs have the same sampling rate of {processor.feature_extractor.sampling_rate}."
-        batch["input_values"] = processor(batch["speech"], sampling_rate=batch["sampling_rate"][0]).input_values
-        if audio_only is False:
-            cls_labels = list(map(lambda e: cls_label_map[e], batch["emotion"]))
-            with processor.as_target_processor():
-                batch["labels"] = processor(batch[data_args.target_text_column]).input_ids
-            for i in range(len(cls_labels)):
-                batch["labels"][i].append(cls_labels[i]) # batch["labels"] element has to be a single list
-        return batch
-
     if training_args.do_train:
         train_dataset = train_dataset.map(
-            prepare_dataset,
+            lambda x: prepare_dataset(x, data_args, processor, cls_label_map),
             batch_size=training_args.per_device_train_batch_size,
             batched=True,
             num_proc=data_args.preprocessing_num_workers,
         )
     if training_args.do_predict:
         val_dataset = val_dataset.map(
-            prepare_dataset,
-            fn_kwargs={'audio_only':True},
+            lambda x: prepare_dataset(x, data_args, processor, cls_label_map, audio_only=True),
             batch_size=training_args.per_device_train_batch_size,
             batched=True,
             num_proc=data_args.preprocessing_num_workers,
         )
     elif training_args.do_eval:
         val_dataset = val_dataset.map(
-            prepare_dataset,
+            lambda x: prepare_dataset(x, data_args, processor, cls_label_map),
             batch_size=training_args.per_device_train_batch_size,
             batched=True,
             num_proc=data_args.preprocessing_num_workers,
@@ -689,7 +761,7 @@ def main():
         logger.info('******* Predict ********')
         data_collator.audio_only=True
         predictions, labels, metrics = trainer.predict(val_dataset, metric_key_prefix="predict")
-        logits_ctc, logits_cls = predictions
+        logits_ctc, logits_cls, logits_prosody, attention_weights = predictions
         pred_ids = np.argmax(logits_cls, axis=-1)
         pred_probs = F.softmax(torch.from_numpy(logits_cls).float(), dim=-1)
         print(val_dataset)
@@ -705,7 +777,7 @@ def main():
 
     elif training_args.do_eval:
         predictions, labels, metrics = trainer.predict(val_dataset, metric_key_prefix="eval")
-        logits_ctc, logits_cls, attention_weights = predictions
+        logits_ctc, logits_cls, logits_prosody, attention_weights = predictions
         pred_ids = np.argmax(logits_cls, axis=-1)
         correct = np.sum(pred_ids == labels[1])
         acc = correct / len(pred_ids)

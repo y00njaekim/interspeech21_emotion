@@ -10,15 +10,17 @@ from torch import nn
 
 class Wav2Vec2ForCTCnCLS(Wav2Vec2PreTrainedModel):
 
-    def __init__(self, config, cls_len=4, alpha=0.01):
+    def __init__(self, config, cls_len=4, prosody_dim=4, alpha=0.01, beta=0.1):
         super().__init__(config)
         self.wav2vec2 = Wav2Vec2Model(config)
         self.dropout = nn.Dropout(config.final_dropout)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size)
         self.cls_head = nn.Linear(config.hidden_size, cls_len)
+        self.prosody_head = nn.Linear(config.hidden_size, prosody_dim)
         self.attention_proj = nn.Linear(config.hidden_size, 1)
         self.init_weights()
         self.alpha = alpha
+        self.beta = beta
 
 
     def freeze_feature_extractor(self):
@@ -64,6 +66,13 @@ class Wav2Vec2ForCTCnCLS(Wav2Vec2PreTrainedModel):
         return loss
 
 
+    def _prosody_loss(self, logits, prosody_labels):
+        loss = None
+        if prosody_labels is not None:
+            loss = F.mse_loss(logits, prosody_labels.float())
+        return loss
+
+
     def forward(
         self,
         input_values,
@@ -71,9 +80,10 @@ class Wav2Vec2ForCTCnCLS(Wav2Vec2PreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
-        labels=None, # tuple: (ctc_labels, cls_labels), shape=(batch_size, target_length)
+        labels=None, # tuple: (ctc_labels, cls_labels, prosody_labels)
         if_ctc=True,
         if_cls=True,
+        if_prosody=True,
         ):
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -86,43 +96,34 @@ class Wav2Vec2ForCTCnCLS(Wav2Vec2PreTrainedModel):
             return_dict=return_dict,
         )
 
-        hidden_states = outputs[0] # this is the last layer's hidden states
+        hidden_states = outputs[0]
         hidden_states = self.dropout(hidden_states)
 
         logits_ctc = self.lm_head(hidden_states)
 
-        # --- Attention Pooling for Classification ---
-        # hidden_states shape: (batch_size, sequence_length, hidden_size)
-        
-        # Generate attention mask corresponding to hidden_states sequence length
+        # Attention Pooling for Classification
         if attention_mask is None:
-            # If no mask provided, assume all frames are valid
-            attention_mask_pool = torch.ones(hidden_states.shape[:2], device=hidden_states.device) # (B, T_hidden)
+            attention_mask_pool = torch.ones(hidden_states.shape[:2], device=hidden_states.device)
         else:
-            # Calculate sequence lengths after feature extraction + encoder
-            output_lengths = self._get_feat_extract_output_lengths(attention_mask.sum(-1)) # (B,)
-            # Create a mask for the hidden states based on calculated lengths
-            attention_mask_pool = torch.zeros(hidden_states.shape[:2], device=hidden_states.device) # (B, T_hidden)
+            output_lengths = self._get_feat_extract_output_lengths(attention_mask.sum(-1))
+            attention_mask_pool = torch.zeros(hidden_states.shape[:2], device=hidden_states.device)
             for i, length in enumerate(output_lengths):
                 attention_mask_pool[i, :length] = 1
 
-        # Calculate attention scores
-        attention_scores = self.attention_proj(hidden_states) # (batch_size, sequence_length, 1)
-
-        # Apply the mask to the scores before softmax
-        # Use a large negative number for masked positions
+        attention_scores = self.attention_proj(hidden_states)
         extended_attention_mask = (1.0 - attention_mask_pool.unsqueeze(-1).float()) * torch.finfo(attention_scores.dtype).min
         attention_scores = attention_scores + extended_attention_mask
+        attention_weights = F.softmax(attention_scores, dim=1)
 
-        # Calculate attention weights using softmax
-        attention_weights = F.softmax(attention_scores, dim=1) # (batch_size, sequence_length, 1)
-
-        # Calculate the weighted sum (pooled output)
-        pooled_output = torch.sum(hidden_states * attention_weights, dim=1) # (batch_size, hidden_size)
+        pooled_output = torch.sum(hidden_states * attention_weights, dim=1)
         
-        # Calculate classification logits using the pooled output
+        # 뒷부분 상태만 사용하여 prosody 예측
+        tail_ratio = 0.3  # 뒤 30% 사용
+        tail_length = int(hidden_states.size(1) * tail_ratio)
+        tail_states = hidden_states[:, -tail_length:, :].mean(dim=1)
+        
         logits_cls = self.cls_head(pooled_output)
-        # --- End of Attention Pooling ---
+        logits_prosody = self.prosody_head(tail_states)
 
         loss = None
         if labels is not None:
@@ -130,15 +131,13 @@ class Wav2Vec2ForCTCnCLS(Wav2Vec2PreTrainedModel):
                 loss_ctc = self._ctc_loss(logits_ctc, labels[0], input_values, attention_mask)
             if if_cls:
                 loss_cls = self._cls_loss(logits_cls, labels[1])
-
-            loss = loss_cls + self.alpha * loss_ctc
-
-        # if not return_dict:
-        #     output = (logits,) + outputs[1:]
-        #     return ((loss,) + output) if loss is not None else output
+            if if_prosody:
+                loss_prosody = self._prosody_loss(logits_prosody, labels[2])
+                
+            loss = loss_cls + self.alpha * loss_ctc + self.beta * loss_prosody
 
         return CausalLMOutput(
-            loss=loss, logits=(logits_ctc, logits_cls, attention_weights), hidden_states=outputs.hidden_states, attentions=outputs.attentions
+            loss=loss, logits=(logits_ctc, logits_cls, logits_prosody, attention_weights), hidden_states=outputs.hidden_states, attentions=outputs.attentions
         )
 
         

@@ -1,6 +1,7 @@
 export MODEL=wav2vec2-large-xlsr-korean
 export TOKENIZER=wav2vec2-large-xlsr-korean
 export ALPHA=0.0
+export BETA=0.1  # prosody loss weight 추가
 export LR=5e-5
 export ACC=1 # batch size * acc = 8
 export WORKER_NUM=4
@@ -20,6 +21,7 @@ export SAVE_PATH="output/kemdy19/${RUN_NAME}"
 --per_device_eval_batch_size="8" \
 --gradient_accumulation_steps=$ACC \
 --alpha $ALPHA \
+--beta $BETA \
 --dataset_name kemdy19 \
 --split_id fold${SPLIT} \
 --evaluation_strategy="steps" \
